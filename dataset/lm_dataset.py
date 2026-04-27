@@ -36,21 +36,51 @@ def post_processing_chat(prompt_content, empty_think_ratio=0.2):
 
 class PretrainDataset(Dataset):
     def __init__(self, data_path, tokenizer, max_length=512):
+        """
+        输入：
+            data_path：预训练 JSON/JSONL 数据路径，样本需要包含 text 字段。
+            tokenizer：Hugging Face tokenizer，用于把文本转换成 token id。
+            max_length：每条样本固定到的最大序列长度，超过会截断，不足会 padding。
+        输出：
+            无显式返回值；初始化 tokenizer、max_length 和 samples。
+        作用：
+            加载预训练文本数据，为 DataLoader 提供按索引读取的固定长度语言模型训练样本。
+        """
         super().__init__()
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.samples = load_dataset('json', data_files=data_path, split='train')
 
     def __len__(self):
+        """
+        输入：
+            无。
+        输出：
+            int：数据集中样本数量。
+        作用：
+            供 DataLoader、Sampler 和训练脚本计算 epoch 长度。
+        """
         return len(self.samples)
 
     def __getitem__(self, index):
+        """
+        输入：
+            index：样本下标。
+        输出：
+            (input_ids, labels)：两个 shape 为 [max_length] 的 LongTensor。
+        作用：
+            读取一条 text 样本，编码为带 BOS/EOS/PAD 的 token 序列，并构造 causal LM 标签。
+            labels 与 input_ids 初始相同，模型 forward 内部会右移后计算“预测下一个 token”的交叉熵。
+            padding 位置的 label 设置为 -100，使 F.cross_entropy(ignore_index=-100) 忽略这些无效 token。
+        """
         sample = self.samples[index]
+        # 预留 2 个位置给 BOS 和 EOS，因此正文最多使用 max_length - 2 个 token。
         tokens = self.tokenizer(str(sample['text']), add_special_tokens=False, max_length=self.max_length - 2, truncation=True).input_ids
         tokens = [self.tokenizer.bos_token_id] + tokens + [self.tokenizer.eos_token_id]
         input_ids = tokens + [self.tokenizer.pad_token_id] * (self.max_length - len(tokens))
         input_ids = torch.tensor(input_ids, dtype=torch.long)
         labels = input_ids.clone()
+        # PAD 只是补齐长度，不应该参与 loss；-100 是 PyTorch 交叉熵默认可忽略标签。
         labels[input_ids == self.tokenizer.pad_token_id] = -100
         return input_ids, labels
 

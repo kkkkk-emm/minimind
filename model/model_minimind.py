@@ -10,6 +10,17 @@ from transformers.modeling_outputs import MoeCausalLMOutputWithPast
 class MiniMindConfig(PretrainedConfig):
     model_type = "minimind"
     def __init__(self, hidden_size=768, num_hidden_layers=8, use_moe=False, **kwargs):
+        """
+        输入：
+            hidden_size：隐藏层维度，也是 token embedding 和 transformer block 内部主通道维度。
+            num_hidden_layers：Transformer block 层数。
+            use_moe：是否把普通 MLP 替换为 MoEFeedForward。
+            **kwargs：额外配置项，如 vocab_size、head 数、RoPE 参数、MoE expert 数等。
+        输出：
+            无显式返回值；初始化 PretrainedConfig 所需字段和 MiniMind 模型结构字段。
+        作用：
+            集中保存模型结构、训练/推理超参数，使模型构建、权重保存和 Transformers 接口能读取同一份配置。
+        """
         super().__init__(**kwargs)
         self.hidden_size = hidden_size
         self.num_hidden_layers = num_hidden_layers
@@ -49,17 +60,53 @@ class MiniMindConfig(PretrainedConfig):
 # 🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏
 class RMSNorm(torch.nn.Module):
     def __init__(self, dim: int, eps: float = 1e-5):
+        """
+        输入：
+            dim：最后一维的特征维度。
+            eps：防止除零的极小常数。
+        输出：
+            无显式返回值；创建可学习缩放参数 weight。
+        作用：
+            初始化 RMSNorm 层，用均方根归一化替代 LayerNorm 中的均值方差归一化。
+        """
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
 
     def norm(self, x):
+        """
+        输入：
+            x：任意前缀维度、最后一维为 hidden/head_dim 的张量。
+        输出：
+            torch.Tensor：按最后一维 RMS 归一化后的张量。
+        作用：
+            计算 x / sqrt(mean(x^2) + eps)，保留方向信息并稳定激活尺度。
+        """
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
     def forward(self, x):
+        """
+        输入：
+            x：需要归一化的隐藏状态。
+        输出：
+            torch.Tensor：归一化并乘以可学习 weight 后的结果，dtype 与输入保持一致。
+        作用：
+            在注意力和 MLP 前后稳定数值范围，减少深层网络训练不稳定。
+        """
         return (self.weight * self.norm(x.float())).type_as(x)
 
 def precompute_freqs_cis(dim: int, end: int = int(32 * 1024), rope_base: float = 1e6, rope_scaling: dict = None):
+    """
+    输入：
+        dim：每个注意力头的维度。
+        end：预计算的最大位置长度。
+        rope_base：RoPE 频率基数，值越大可支持更长上下文。
+        rope_scaling：可选 YaRN 缩放配置，用于推理时扩展上下文长度。
+    输出：
+        (freqs_cos, freqs_sin)：形状为 [end, dim] 的 cos/sin 位置编码表。
+    作用：
+        预先计算旋转位置编码需要的 cos/sin，forward 时按序列位置切片使用，避免每次重复计算。
+    """
     freqs, attn_factor = 1.0 / (rope_base ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim)), 1.0
     if rope_scaling is not None: # YaRN: f'(i) = f(i)((1-γ) + γ/s), where γ∈[0,1] is linear ramp
         orig_max, factor, beta_fast, beta_slow, attn_factor = (
@@ -78,18 +125,47 @@ def precompute_freqs_cis(dim: int, end: int = int(32 * 1024), rope_base: float =
     return freqs_cos, freqs_sin
 
 def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
+    """
+    输入：
+        q：query 张量，通常形状为 [batch, seq_len, heads, head_dim]。
+        k：key 张量，通常形状为 [batch, seq_len, kv_heads, head_dim]。
+        cos：当前位置对应的 RoPE cos 表。
+        sin：当前位置对应的 RoPE sin 表。
+        unsqueeze_dim：把 cos/sin 扩展到 q/k 形状时插入的维度。
+    输出：
+        (q_embed, k_embed)：应用旋转位置编码后的 query 和 key。
+    作用：
+        把绝对位置信息以旋转方式注入 q/k，使注意力分数天然包含相对位置信息。
+    """
     def rotate_half(x): return torch.cat((-x[..., x.shape[-1] // 2:], x[..., : x.shape[-1] // 2]), dim=-1)
     q_embed = ((q * cos.unsqueeze(unsqueeze_dim)) + (rotate_half(q) * sin.unsqueeze(unsqueeze_dim))).to(q.dtype)
     k_embed = ((k * cos.unsqueeze(unsqueeze_dim)) + (rotate_half(k) * sin.unsqueeze(unsqueeze_dim))).to(k.dtype)
     return q_embed, k_embed
 
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """
+    输入：
+        x：key 或 value 张量，形状为 [batch, seq_len, num_key_value_heads, head_dim]。
+        n_rep：每个 KV head 需要复制的次数。
+    输出：
+        torch.Tensor：复制后的 KV 张量，head 数变为 num_key_value_heads * n_rep。
+    作用：
+        支持 GQA/MQA：让较少的 KV heads 复用到更多 query heads，降低 KV 计算和缓存成本。
+    """
     bs, slen, num_key_value_heads, head_dim = x.shape
     if n_rep == 1: return x
     return (x[:, :, :, None, :].expand(bs, slen, num_key_value_heads, n_rep, head_dim).reshape(bs, slen, num_key_value_heads * n_rep, head_dim))
 
 class Attention(nn.Module):
     def __init__(self, config: MiniMindConfig):
+        """
+        输入：
+            config：MiniMindConfig，提供 hidden_size、head 数、head_dim、dropout、flash_attn 等注意力参数。
+        输出：
+            无显式返回值；创建 q/k/v/o 投影、q/k RMSNorm 和 dropout 层。
+        作用：
+            初始化自注意力模块。该实现支持 GQA、RoPE、KV cache，并在条件满足时使用 PyTorch Flash Attention。
+        """
         super().__init__()
         self.num_key_value_heads = config.num_attention_heads if config.num_key_value_heads is None else config.num_key_value_heads
         self.n_local_heads = config.num_attention_heads
@@ -109,6 +185,18 @@ class Attention(nn.Module):
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention') and config.flash_attn
 
     def forward(self, x, position_embeddings, past_key_value=None, use_cache=False, attention_mask=None):
+        """
+        输入：
+            x：当前层输入隐藏状态，形状为 [batch, seq_len, hidden_size]。
+            position_embeddings：RoPE 的 (cos, sin) 切片，对应当前 token 位置。
+            past_key_value：可选历史 KV cache，生成阶段用于避免重复计算历史 token。
+            use_cache：是否返回新的 KV cache。
+            attention_mask：可选注意力 mask，padding 位置会被屏蔽。
+        输出：
+            (output, past_kv)：注意力输出隐藏状态，以及可选的当前层 KV cache。
+        作用：
+            计算因果自注意力：生成 q/k/v、注入 RoPE、拼接历史 KV、执行 attention，再映射回 hidden_size。
+        """
         bsz, seq_len, _ = x.shape
         xq, xk, xv = self.q_proj(x), self.k_proj(x), self.v_proj(x)
         xq = xq.view(bsz, seq_len, self.n_local_heads, self.head_dim)
@@ -116,11 +204,14 @@ class Attention(nn.Module):
         xv = xv.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
         xq, xk = self.q_norm(xq), self.k_norm(xk)
         cos, sin = position_embeddings
+        # RoPE 只作用在 q/k 上，value 不携带位置信息。
         xq, xk = apply_rotary_pos_emb(xq, xk, cos, sin)
         if past_key_value is not None:
+            # 生成时把历史 KV 与当前 token 的 KV 拼接，避免重复计算历史上下文。
             xk = torch.cat([past_key_value[0], xk], dim=1)
             xv = torch.cat([past_key_value[1], xv], dim=1)
         past_kv = (xk, xv) if use_cache else None
+        # GQA 中 KV head 数可能少于 query head 数，因此需要 repeat 到相同 head 数后再做注意力。
         xq, xk, xv = (xq.transpose(1, 2), repeat_kv(xk, self.n_rep).transpose(1, 2), repeat_kv(xv, self.n_rep).transpose(1, 2))
         if self.flash and (seq_len > 1) and (not self.is_causal or past_key_value is None) and (attention_mask is None or torch.all(attention_mask == 1)):
             output = F.scaled_dot_product_attention(xq, xk, xv, dropout_p=self.dropout if self.training else 0.0, is_causal=self.is_causal)
@@ -135,6 +226,15 @@ class Attention(nn.Module):
 
 class FeedForward(nn.Module):
     def __init__(self, config: MiniMindConfig, intermediate_size: int = None):
+        """
+        输入：
+            config：MiniMindConfig，提供 hidden_size、intermediate_size、hidden_act 等 MLP 参数。
+            intermediate_size：可选中间层维度；不传时使用 config.intermediate_size。
+        输出：
+            无显式返回值；创建 gate/up/down 三个线性层和激活函数。
+        作用：
+            初始化 SwiGLU 风格前馈网络，用于每个 Transformer block 的非线性特征变换。
+        """
         super().__init__()
         intermediate_size = intermediate_size or config.intermediate_size
         self.gate_proj = nn.Linear(config.hidden_size, intermediate_size, bias=False)
@@ -143,10 +243,26 @@ class FeedForward(nn.Module):
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x):
+        """
+        输入：
+            x：隐藏状态，形状通常为 [batch, seq_len, hidden_size]。
+        输出：
+            torch.Tensor：前馈网络输出，形状与输入一致。
+        作用：
+            计算 down_proj(act(gate_proj(x)) * up_proj(x))，用门控结构增强 MLP 表达能力。
+        """
         return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
 class MOEFeedForward(nn.Module):
     def __init__(self, config: MiniMindConfig):
+        """
+        输入：
+            config：MiniMindConfig，提供 expert 数、每 token 激活 expert 数、MoE 中间层维度和辅助损失系数。
+        输出：
+            无显式返回值；创建 router gate 和多个 FeedForward experts。
+        作用：
+            初始化 MoE 前馈层，让不同 token 路由到不同 expert，从而提高模型容量但减少单 token 激活计算量。
+        """
         super().__init__()
         self.config = config
         self.gate = nn.Linear(config.hidden_size, config.num_experts, bias=False)
@@ -154,6 +270,14 @@ class MOEFeedForward(nn.Module):
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x):
+        """
+        输入：
+            x：隐藏状态，形状为 [batch, seq_len, hidden_size]。
+        输出：
+            torch.Tensor：MoE 聚合后的隐藏状态，形状与输入一致。
+        作用：
+            对每个 token 计算 expert 路由概率，选 top-k experts 处理并加权合并；训练时额外记录负载均衡 aux_loss。
+        """
         batch_size, seq_len, hidden_dim = x.shape
         x_flat = x.view(-1, hidden_dim)
         scores = F.softmax(self.gate(x_flat), dim=-1)
@@ -161,6 +285,7 @@ class MOEFeedForward(nn.Module):
         if self.config.norm_topk_prob: topk_weight = topk_weight / (topk_weight.sum(dim=-1, keepdim=True) + 1e-20)
         y = torch.zeros_like(x_flat)
         for i, expert in enumerate(self.experts):
+            # 只把被路由到当前 expert 的 token 送入该 expert，减少无效计算。
             mask = (topk_idx == i)
             if mask.any():
                 token_idx = mask.any(dim=-1).nonzero().flatten()
@@ -169,6 +294,7 @@ class MOEFeedForward(nn.Module):
             elif self.training:
                 y[0, 0] += 0 * sum(p.sum() for p in expert.parameters())
         if self.training and self.config.router_aux_loss_coef > 0:
+            # aux_loss 鼓励 token 更均匀地分配到各 expert，避免少数 expert 过载。
             load = F.one_hot(topk_idx, self.config.num_experts).float().mean(0)
             self.aux_loss = (load * scores.mean(0)).sum() * self.config.num_experts * self.config.router_aux_loss_coef
         else:
@@ -177,6 +303,15 @@ class MOEFeedForward(nn.Module):
 
 class MiniMindBlock(nn.Module):
     def __init__(self, layer_id: int, config: MiniMindConfig):
+        """
+        输入：
+            layer_id：层编号，本实现中主要用于构造列表时标识层序。
+            config：MiniMindConfig，决定注意力、归一化和 MLP/MoE 结构。
+        输出：
+            无显式返回值；创建一个 Transformer block 的注意力、归一化和前馈模块。
+        作用：
+            初始化 MiniMind 的单层 decoder block，结构为 RMSNorm -> self-attention -> residual -> RMSNorm -> MLP/MoE -> residual。
+        """
         super().__init__()
         self.self_attn = Attention(config)
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -184,6 +319,18 @@ class MiniMindBlock(nn.Module):
         self.mlp = FeedForward(config) if not config.use_moe else MOEFeedForward(config)
 
     def forward(self, hidden_states, position_embeddings, past_key_value=None, use_cache=False, attention_mask=None):
+        """
+        输入：
+            hidden_states：当前层输入，形状为 [batch, seq_len, hidden_size]。
+            position_embeddings：当前序列位置对应的 RoPE cos/sin。
+            past_key_value：可选历史 KV cache。
+            use_cache：是否返回当前层 KV cache。
+            attention_mask：可选 padding mask。
+        输出：
+            (hidden_states, present_key_value)：本层输出隐藏状态和可选 KV cache。
+        作用：
+            执行一层 Transformer decoder：先做带残差的因果注意力，再做带残差的前馈网络。
+        """
         residual = hidden_states
         hidden_states, present_key_value = self.self_attn(
             self.input_layernorm(hidden_states), position_embeddings,
@@ -195,6 +342,14 @@ class MiniMindBlock(nn.Module):
 
 class MiniMindModel(nn.Module):
     def __init__(self, config: MiniMindConfig):
+        """
+        输入：
+            config：MiniMindConfig，包含词表大小、层数、hidden_size、RoPE 和 MoE 等模型结构参数。
+        输出：
+            无显式返回值；创建 embedding、dropout、多层 MiniMindBlock、最终 RMSNorm 和 RoPE 缓冲区。
+        作用：
+            初始化不含 lm_head 的主体 decoder 模型，把 token id 转换为最终隐藏状态。
+        """
         super().__init__()
         self.config = config
         self.vocab_size, self.num_hidden_layers = config.vocab_size, config.num_hidden_layers
@@ -207,6 +362,18 @@ class MiniMindModel(nn.Module):
         self.register_buffer("freqs_sin", freqs_sin, persistent=False)
 
     def forward(self, input_ids, attention_mask=None, past_key_values=None, use_cache=False, **kwargs):
+        """
+        输入：
+            input_ids：token id 张量，形状为 [batch, seq_len]。
+            attention_mask：可选 mask，1 表示有效 token，0 表示需要屏蔽。
+            past_key_values：可选每层历史 KV cache，生成阶段使用。
+            use_cache：是否返回新的 KV cache。
+            **kwargs：兼容 Transformers 调用的额外参数，本函数不主动使用。
+        输出：
+            (hidden_states, presents, aux_loss)：最终隐藏状态、每层 KV cache 列表和 MoE 辅助损失。
+        作用：
+            完成主体模型前向：token embedding、按位置切 RoPE、多层 decoder block、最终归一化，并汇总 MoE aux_loss。
+        """
         batch_size, seq_length = input_ids.shape
         if hasattr(past_key_values, 'layers'): past_key_values = None
         past_key_values = past_key_values or [None] * len(self.layers)
@@ -219,6 +386,7 @@ class MiniMindModel(nn.Module):
         position_embeddings = (self.freqs_cos[start_pos:start_pos + seq_length], self.freqs_sin[start_pos:start_pos + seq_length])
         presents = []
         for layer, past_key_value in zip(self.layers, past_key_values):
+            # 每层都复用同一段 RoPE 位置表，但拥有独立的注意力、MLP/MoE 参数。
             hidden_states, present = layer(
                 hidden_states,
                 position_embeddings,
@@ -235,6 +403,14 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
     config_class = MiniMindConfig
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
     def __init__(self, config: MiniMindConfig = None):
+        """
+        输入：
+            config：MiniMindConfig；为 None 时使用默认配置。
+        输出：
+            无显式返回值；创建 MiniMindModel 主体和 lm_head。
+        作用：
+            封装用于自回归语言模型训练/推理的完整模型，并接入 Transformers 的 PreTrainedModel/GenerationMixin 接口。
+        """
         self.config = config or MiniMindConfig()
         super().__init__(self.config)
         self.model = MiniMindModel(self.config)
@@ -243,11 +419,26 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
         self.post_init()
 
     def forward(self, input_ids, attention_mask=None, past_key_values=None, use_cache=False, logits_to_keep=0, labels=None, **kwargs):
+        """
+        输入：
+            input_ids：输入 token id，形状为 [batch, seq_len]。
+            attention_mask：可选 mask，用于屏蔽 padding。
+            past_key_values：可选 KV cache，生成阶段用于增量推理。
+            use_cache：是否返回新的 KV cache。
+            logits_to_keep：只计算/保留最后若干位置的 logits；训练时默认为 0，表示保留全部。
+            labels：可选训练标签；传入时计算 causal LM loss。
+            **kwargs：传给 MiniMindModel 的额外参数。
+        输出：
+            MoeCausalLMOutputWithPast：包含 loss、aux_loss、logits、past_key_values、hidden_states。
+        作用：
+            调用主体模型得到 hidden_states，再用 lm_head 映射到词表 logits；训练时右移 logits/labels 计算下一个 token 的交叉熵。
+        """
         hidden_states, past_key_values, aux_loss = self.model(input_ids, attention_mask, past_key_values, use_cache, **kwargs)
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
         logits = self.lm_head(hidden_states[:, slice_indices, :])
         loss = None
         if labels is not None:
+            # 语言模型训练目标是用位置 t 的输出预测位置 t+1 的 token，因此 logits 去掉最后一位，labels 去掉第一位。
             x, y = logits[..., :-1, :].contiguous(), labels[..., 1:].contiguous()
             loss = F.cross_entropy(x.view(-1, x.size(-1)), y.view(-1), ignore_index=-100)
         return MoeCausalLMOutputWithPast(loss=loss, aux_loss=aux_loss, logits=logits, past_key_values=past_key_values, hidden_states=hidden_states)
