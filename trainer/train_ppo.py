@@ -165,7 +165,6 @@ def ppo_train_epoch(epoch, loader, iters, rollout_engine, ref_model, actor_sched
         prompts = batch["prompt"]  # list[str], length B
         enc = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=args.max_seq_len,
                         padding_side="left").to(args.device)  # input_ids: [B, P], attention_mask: [B, P]
-        prompt_length = enc.input_ids.shape[1]
 
         # ========== Rollout 阶段：使用 Actor 生成回复 ==========
         rollout_result = rollout_engine.rollout(
@@ -176,9 +175,12 @@ def ppo_train_epoch(epoch, loader, iters, rollout_engine, ref_model, actor_sched
             temperature=0.8,
         )
         gen_out = rollout_result.output_ids  # [B, P+R]，P=prompt_length, R=response_length
+        completion_ids = rollout_result.completion_ids
+        prompt_lens = rollout_result.prompt_lens.to(args.device)
         responses_text = rollout_result.completions  # list[str]，模型生成的文本回复
         
         # 计算每条回复的多维奖励
+        old_resp_logp = rollout_result.per_token_logps.to(args.device)
         rewards = calculate_rewards(prompts, responses_text, reward_model)  # [B]
 
         if args.debug_mode and is_main_process() and step % args.debug_interval == 0:
@@ -188,7 +190,7 @@ def ppo_train_epoch(epoch, loader, iters, rollout_engine, ref_model, actor_sched
                 Logger(f"{'=' * 30} [DEBUG] sample[{i}] CONTEXT_BEGIN {'=' * 30}")
                 Logger(prompts[i])
                 Logger(f"{'=' * 31} [DEBUG] sample[{i}] CONTEXT_END {'=' * 31}")
-                Logger(f"[DEBUG] prompt_len={prompt_length}, response_len={len(responses_text[i])}")
+                Logger(f"[DEBUG] prompt_len={prompt_lens[i].item()}, response_len={len(responses_text[i])}")
                 Logger(f"{'=' * 28} [DEBUG] sample[{i}] RESPONSE_BEGIN {'=' * 28}")
                 Logger(responses_text[i])
                 Logger(f"{'=' * 29} [DEBUG] sample[{i}] RESPONSE_END {'=' * 29}")
@@ -197,24 +199,13 @@ def ppo_train_epoch(epoch, loader, iters, rollout_engine, ref_model, actor_sched
 
         full_mask = (gen_out != tokenizer.pad_token_id).long()  # [B, P+R]
         labels = gen_out[:, 1:].clone()  # [B, P+R-1]
-        seq_len, resp_start = gen_out.size(1) - 1, prompt_length - 1
-        # resp_mask: [B, P+R-1]，标记回复部分（0-indexed，右移后与 labels 对齐）
-        resp_mask = torch.arange(seq_len, device=gen_out.device).unsqueeze(0) >= resp_start
-        # final_mask: [B, P+R-1]，1 表示回复部分且不是 padding，这些位置才计入 loss
-        final_mask = (resp_mask & (~labels.eq(tokenizer.pad_token_id))).float()  # [B, P+R-1]
-        
-        # ========== 提取回复部分的 token 和 mask ==========
         B = len(prompts)
-        resp_labels = labels[:, resp_start:]  # [B, R]，仅回复部分的 token id
-        resp_idx = torch.arange(resp_labels.size(1), device=gen_out.device).unsqueeze(0)  # [1, R]
-        resp_pad_mask = ~resp_labels.eq(tokenizer.pad_token_id)  # [B, R]，True 表示非 padding
-        resp_lengths = resp_pad_mask.sum(dim=1)  # [B]，每个样本回复的有效 token 数
-        
-        # 找出 EOS token 的位置
-        eos_mask = resp_labels.eq(tokenizer.eos_token_id) & resp_pad_mask  # [B, R]，EOS 位置
-        has_eos = eos_mask.any(dim=1)  # [B]，是否包含 EOS
-        eos_pos = torch.argmax(eos_mask.int(), dim=1)  # [B]，第一个 EOS 的位置
-        # 如果有 EOS，长度设为 EOS 位置 + 1；否则用全 token 数
+        resp_labels = completion_ids
+        resp_idx = torch.arange(resp_labels.size(1), device=gen_out.device).unsqueeze(0)
+        logp_pos = prompt_lens.unsqueeze(1) - 1 + resp_idx
+        resp_pad_mask = rollout_result.completion_mask.to(args.device).bool()
+        resp_lengths = resp_pad_mask.sum(dim=1); valid_resp = resp_lengths > 0; eos_mask = resp_labels.eq(tokenizer.eos_token_id) & resp_pad_mask
+        has_eos = eos_mask.any(dim=1); eos_pos = torch.argmax(eos_mask.int(), dim=1)
         resp_lengths = torch.where(has_eos, eos_pos + 1, resp_lengths).long().clamp(min=1)
         # resp_policy_mask: [B, R]，1 表示 token 被认为是策略生成的有效 token（用于 policy loss）
         resp_policy_mask = ((resp_idx < resp_lengths.unsqueeze(1)) & resp_pad_mask).float()
@@ -224,27 +215,14 @@ def ppo_train_epoch(epoch, loader, iters, rollout_engine, ref_model, actor_sched
         # ========== 计算参考模型 logp 和 Critic 价值 ==========
         with torch.no_grad():  # Rollout 阶段只需推理获取 old_logp 和 old_values，切断梯度省显存
             critic_for_rollout = critic_model.module if isinstance(critic_model, DistributedDataParallel) else critic_model
-            values_seq = critic_for_rollout(input_ids=gen_out, attention_mask=full_mask)  # [B, P+R-1]
-            old_resp_values = values_seq[:, resp_start:-1] * resp_value_mask  # [B, R]，裁剪回复部分
+            values_seq = critic_for_rollout(input_ids=gen_out, attention_mask=full_mask)
+            old_resp_values = values_seq.gather(1, logp_pos) * resp_value_mask
             
-            # 计算 Actor 的当前 logp（用于计算 log ratio）
-            actor_for_rollout = actor_model.module if isinstance(actor_model, DistributedDataParallel) else actor_model
-            with autocast_ctx:
-                logits = actor_for_rollout(input_ids=gen_out, attention_mask=full_mask).logits
-            
-            # [B, P+R-1, V] -> gather -> [B, P+R-1]，每个位置的当前策略 logp
-            old_resp_logp = F.log_softmax(logits[:, :-1], dim=-1).gather(2, labels.unsqueeze(-1)).squeeze(-1)[:, resp_start:]
-            
-            # 计算参考模型 logp（用于 KL 散度惩罚）
-            ref_logp_all = F.log_softmax(ref_model(input_ids=gen_out, attention_mask=full_mask).logits[:, :-1], dim=-1).gather(2, labels.unsqueeze(-1)).squeeze(-1)
-            ref_resp_logp = ref_logp_all[:, resp_start:]  # [B, R]
-            
-            # ========== 计算 token 级别奖励和 GAE ==========
-            # token_rewards: [B, R]，初始化为 0，最后一个有效 token 处加上外部奖励
+            ref_resp_logp = F.log_softmax(ref_model(input_ids=gen_out, attention_mask=full_mask).logits[:, :-1], dim=-1).gather(2, labels.unsqueeze(-1)).squeeze(-1).gather(1, logp_pos)
             token_rewards = torch.zeros_like(old_resp_logp)
             last_idx = resp_lengths - 1  # [B]，每个样本最后一个有效 token 的位置
             # 广播方式加奖励：batch 维和 token 维同时索引
-            token_rewards[torch.arange(B, device=args.device), last_idx] += rewards  # 末尾加外部奖励
+            token_rewards[torch.arange(B, device=args.device)[valid_resp], last_idx[valid_resp]] += rewards[valid_resp]  # 末尾加外部奖励
 
             # GAE 计算：从末尾往前递归计算优势
             gen_len = old_resp_values.size(1)  # R，回复长度
@@ -296,7 +274,7 @@ def ppo_train_epoch(epoch, loader, iters, rollout_engine, ref_model, actor_sched
                 
                 # ========== 前向传播：Critic 部分 ==========
                 mb_values_seq = critic_unwrapped(input_ids=gen_out[inds], attention_mask=full_mask[inds])
-                mb_resp_values = mb_values_seq[:, resp_start:-1]  # [mb_size, R]
+                mb_resp_values = mb_values_seq.gather(1, logp_pos[inds])
 
                 # ========== 前向传播：Actor 部分 ==========
                 with autocast_ctx:
@@ -305,8 +283,7 @@ def ppo_train_epoch(epoch, loader, iters, rollout_engine, ref_model, actor_sched
                     aux_loss = res.aux_loss if lm_config.use_moe else torch.tensor(0.0, device=args.device)
 
                 # 计算新的策略 logp（用于比率计算）
-                mb_logp_all = F.log_softmax(res.logits[:, :-1], dim=-1).gather(2, labels[inds].unsqueeze(-1)).squeeze(-1)
-                mb_resp_logp = mb_logp_all[:, resp_start:]  # [mb_size, R]
+                mb_resp_logp = F.log_softmax(res.logits[:, :-1], dim=-1).gather(2, labels[inds].unsqueeze(-1)).squeeze(-1).gather(1, logp_pos[inds])  # [mb_size, R]
                 
                 # ========== 计算 PPO 裁剪相关项 ==========
                 # log_ratio = log(pi_new/pi_old) = logp_new - logp_old
@@ -400,7 +377,7 @@ def ppo_train_epoch(epoch, loader, iters, rollout_engine, ref_model, actor_sched
             critic_optimizer.zero_grad()
         
         # ========== 更新 Rollout 引擎的策略模型权重 ==========
-        if is_main_process() and step % args.save_interval == 0: 
+        if step % args.save_interval == 0 or step == iters: 
             rollout_engine.update_policy(actor_model)
 
         # ========== 日志记录 ==========
@@ -452,10 +429,9 @@ def ppo_train_epoch(epoch, loader, iters, rollout_engine, ref_model, actor_sched
             actor_model.train()
             del actor_state
 
-        # ========== 清理显存 ==========
-        del enc, gen_out, responses_text, rewards, full_mask, values_seq, advantages
-        del logits, labels, final_mask, resp_labels, resp_idx, resp_pad_mask, eos_mask, has_eos, eos_pos, resp_lengths, resp_policy_mask, resp_value_mask, old_resp_logp, ref_logp_all, ref_resp_logp
-        del kl, kl_ref, policy_loss, value_loss, loss, token_rewards, returns, old_resp_values
+        del enc, gen_out, completion_ids, responses_text, rewards, full_mask, values_seq, advantages
+        del labels, resp_labels, resp_idx, resp_pad_mask, valid_resp, eos_mask, has_eos, eos_pos, resp_lengths, resp_policy_mask, resp_value_mask, old_resp_logp, ref_resp_logp
+        del kl, kl_ref, policy_loss, value_loss, loss, token_rewards, returns, old_resp_values, prompt_lens, logp_pos
 
 
 if __name__ == "__main__":
@@ -612,8 +588,7 @@ if __name__ == "__main__":
     if dist.is_initialized():
         actor_model = DistributedDataParallel(actor_model, device_ids=[local_rank])
         critic_model = DistributedDataParallel(critic_model, device_ids=[local_rank])
-    # 初始时更新 rollout 引擎的策略模型
-    if is_main_process(): rollout_engine.update_policy(actor_model)
+    rollout_engine.update_policy(actor_model)
     
     # ========== 8. 开始训练 ==========
     for epoch in range(start_epoch, args.epochs):
