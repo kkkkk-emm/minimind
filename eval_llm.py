@@ -85,7 +85,7 @@ def main():
             pad_token_id=tokenizer.pad_token_id, eos_token_id=tokenizer.eos_token_id,
             top_p=args.top_p, temperature=args.temperature, repetition_penalty=1
         )
-        response = tokenizer.decode(generated_ids[0][len(inputs["input_ids"][0]):], skip_special_tokens=True)
+        response = tokenizer.decode(generated_ids[0][len(inputs["input_ids"][0]):], skip_special_tokens=True) # 只取回答部分的内容
         conversation.append({"role": "assistant", "content": response})
         gen_tokens = len(generated_ids[0]) - len(inputs["input_ids"][0])
         print(f'\n[Speed]: {gen_tokens / (time.time() - st):.2f} tokens/s\n\n') if args.show_speed else print('\n\n')

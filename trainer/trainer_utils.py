@@ -265,6 +265,17 @@ class SkipBatchSampler(Sampler):
 
 class LMForRewardModel:
     def __init__(self, model_path, device="cuda", dtype=torch.float16):
+        """
+        输入：
+            model_path：预训练奖励模型路径，例如 internlm2-1_8b-reward；无张量维度。
+            device：模型加载和推理的设备，默认 cuda，也可为 cpu。
+            dtype：模型参数数据类型，默认 float16 节省显存。
+        输出：
+            无显式返回值；初始化 tokenizer、模型、设备等成员变量。
+        作用：
+            加载一个预训练奖励模型（通常是分类模型），用于评估生成回复的质量。
+            奖励模型通常在人类反馈数据集上微调，学会预测回复的质量评分。
+        """
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
         self.model = AutoModel.from_pretrained(model_path, torch_dtype=dtype, trust_remote_code=True)
         self.model = self.model.to(device).eval()
@@ -272,12 +283,29 @@ class LMForRewardModel:
 
     @torch.no_grad()
     def get_score(self, messages, response):
+        """
+        输入：
+            messages：消息列表，每个元素为 dict，包含 role 和 content 键；
+                列表可能包含 system/user/assistant 等多轮对话。
+            response：模型生成的回复字符串；无张量维度。
+        输出：
+            float：奖励分数，范围裁剪到 [-3.0, 3.0]；分数越高表示回复质量越好。
+        作用：
+            把历史对话和新回复格式化为输入，送入奖励模型推理，得到质量评分。
+            评分用于 PPO 的外部奖励信号。
+        """
+        # 拼接对话历史（除最后一条消息外）
         history_text = "\n".join([f"{m['role']}: {m['content']}" for m in messages[:-1]])
+        # 提取最后一条消息（通常是 user query）
         last_query = messages[-1]['content'] if messages else ""
+        # 构造完整的对话上下文
         message_context = f"{history_text}\n以上是对话历史。我的新问题是：\n{last_query}" if history_text else last_query
+        # 格式化为评估消息对
         eval_messages = [
             {"role": "user", "content": message_context},
             {"role": "assistant", "content": response}
         ]
+        # 调用奖励模型的 get_score 方法得到评分
         score = self.model.get_score(self.tokenizer, eval_messages)
+        # 裁剪分数到 [-3.0, 3.0] 范围，防止奖励过大
         return max(min(score, 3.0), -3.0)
